@@ -2,6 +2,16 @@
 
 Sync gallery images from Aula and keep only photos that contain your own kids using local face recognition.
 
+This tool is built on top of [`aula-cli`](https://github.com/olegam/aula-cli): `aula-cli` handles Aula authentication and API access, while this tool uses local facial recognition to store only the photos that contain your own kids.
+
+## Typical use case
+
+Use this when you want a local folder of relevant Aula gallery photos without manually reviewing everything:
+
+1. Login once with `aula-cli login`.
+2. Add reference photos per child in `data/reference/<child-name>/`.
+3. Run `aula-cli-my-kids-photos sync` regularly to fetch new media and keep only matching photos.
+
 ## Quick Start
 
 1. Install deps:

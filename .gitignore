@@ -1,0 +1,7 @@
+node_modules
+.DS_Store
+.cursor
+
+data/photos
+data/cache
+data/reference

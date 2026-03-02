@@ -1,0 +1,21 @@
+{
+  "name": "aula-cli-my-kids-photos",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "aula-cli-my-kids-photos": "src/index.ts"
+  },
+  "scripts": {
+    "link": "bun link",
+    "init": "bun run src/index.ts init",
+    "sync": "bun run src/index.ts sync",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

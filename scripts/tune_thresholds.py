@@ -3,9 +3,18 @@ import json
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import face_recognition
+import numpy as np
 
-from filter_kids import IMAGE_EXTENSIONS, build_kid_encodings, pick_best_kid_for_face
+from filter_kids import (
+    IMAGE_EXTENSIONS,
+    build_kid_embedding_matrices,
+    build_kid_encodings,
+    get_face_app,
+    get_face_bbox,
+    get_face_embedding,
+    load_image,
+    pick_best_kid_for_face,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,51 +35,56 @@ def list_images(root: Path) -> List[Path]:
 
 def candidate_thresholds(limit: int) -> List[Dict[str, float]]:
     preset = [
-        {"tolerance": 0.36, "minFacePx": 90, "minVotes": 3, "distanceMargin": 0.06},
-        {"tolerance": 0.38, "minFacePx": 90, "minVotes": 2, "distanceMargin": 0.06},
-        {"tolerance": 0.40, "minFacePx": 85, "minVotes": 2, "distanceMargin": 0.05},
-        {"tolerance": 0.42, "minFacePx": 85, "minVotes": 2, "distanceMargin": 0.05},
-        {"tolerance": 0.44, "minFacePx": 80, "minVotes": 2, "distanceMargin": 0.04},
-        {"tolerance": 0.40, "minFacePx": 80, "minVotes": 1, "distanceMargin": 0.05},
-        {"tolerance": 0.42, "minFacePx": 75, "minVotes": 1, "distanceMargin": 0.04},
-        {"tolerance": 0.45, "minFacePx": 80, "minVotes": 2, "distanceMargin": 0.03},
-        {"tolerance": 0.46, "minFacePx": 75, "minVotes": 1, "distanceMargin": 0.03},
-        {"tolerance": 0.48, "minFacePx": 70, "minVotes": 1, "distanceMargin": 0.02},
+        {"tolerance": 0.35, "minFacePx": 90, "minVotes": 2, "distanceMargin": 0.08},
+        {"tolerance": 0.38, "minFacePx": 90, "minVotes": 2, "distanceMargin": 0.07},
+        {"tolerance": 0.40, "minFacePx": 85, "minVotes": 2, "distanceMargin": 0.07},
+        {"tolerance": 0.42, "minFacePx": 85, "minVotes": 2, "distanceMargin": 0.06},
+        {"tolerance": 0.45, "minFacePx": 80, "minVotes": 2, "distanceMargin": 0.06},
+        {"tolerance": 0.48, "minFacePx": 80, "minVotes": 2, "distanceMargin": 0.05},
+        {"tolerance": 0.50, "minFacePx": 75, "minVotes": 1, "distanceMargin": 0.05},
+        {"tolerance": 0.52, "minFacePx": 75, "minVotes": 1, "distanceMargin": 0.04},
+        {"tolerance": 0.55, "minFacePx": 70, "minVotes": 1, "distanceMargin": 0.04},
+        {"tolerance": 0.58, "minFacePx": 70, "minVotes": 1, "distanceMargin": 0.03},
     ]
     if limit <= len(preset):
         return preset[:limit]
     return preset
 
 
-def extract_face_records(path: Path) -> List[Tuple[List[float], int]]:
+def extract_face_records(path: Path) -> List[Tuple[np.ndarray, int]]:
+    app = get_face_app()
+    image_data = load_image(path)
+    if image_data is None:
+        return []
+
     try:
-        image_data = face_recognition.load_image_file(str(path))
-        face_locations = face_recognition.face_locations(image_data, model="hog")
+        faces = app.get(image_data)
     except Exception:
         return []
 
-    if not face_locations:
+    if not faces:
         return []
 
-    encodings = face_recognition.face_encodings(image_data, known_face_locations=face_locations)
-    if not encodings:
-        return []
-
-    records: List[Tuple[List[float], int]] = []
-    for encoding, (top, right, bottom, left) in zip(encodings, face_locations):
-        width = max(0, right - left)
-        height = max(0, bottom - top)
-        records.append((encoding, min(width, height)))
+    records: List[Tuple[np.ndarray, int]] = []
+    for face in faces:
+        bbox = get_face_bbox(face)
+        embedding = get_face_embedding(face)
+        if bbox is None or embedding is None:
+            continue
+        left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
+        width = max(0.0, float(right - left))
+        height = max(0.0, float(bottom - top))
+        records.append((embedding, int(min(width, height))))
     return records
 
 
-def preload_face_records(images: List[Path]) -> Dict[str, List[Tuple[List[float], int]]]:
+def preload_face_records(images: List[Path]) -> Dict[str, List[Tuple[np.ndarray, int]]]:
     return {str(path): extract_face_records(path) for path in images}
 
 
 def predicted_positive(
-    records: List[Tuple[List[float], int]],
-    known_kids: Dict[str, List[List[float]]],
+    records: List[Tuple[np.ndarray, int]],
+    kid_matrices: Dict[str, np.ndarray],
     tolerance: float,
     min_face_px: int,
     min_votes: int,
@@ -81,7 +95,7 @@ def predicted_positive(
             continue
         winner = pick_best_kid_for_face(
             face_encoding=encoding,
-            kid_encodings=known_kids,
+            kid_matrices=kid_matrices,
             tolerance=tolerance,
             min_votes=min_votes,
             distance_margin=distance_margin,
@@ -94,9 +108,9 @@ def predicted_positive(
 def evaluate(
     positives: List[Path],
     negatives: List[Path],
-    positive_records: Dict[str, List[Tuple[List[float], int]]],
-    negative_records: Dict[str, List[Tuple[List[float], int]]],
-    known_kids: Dict[str, List[List[float]]],
+    positive_records: Dict[str, List[Tuple[np.ndarray, int]]],
+    negative_records: Dict[str, List[Tuple[np.ndarray, int]]],
+    kid_matrices: Dict[str, np.ndarray],
     tolerance: float,
     min_face_px: int,
     min_votes: int,
@@ -107,7 +121,7 @@ def evaluate(
     for image_path in positives:
         is_positive = predicted_positive(
             records=positive_records.get(str(image_path), []),
-            known_kids=known_kids,
+            kid_matrices=kid_matrices,
             tolerance=tolerance,
             min_face_px=min_face_px,
             min_votes=min_votes,
@@ -121,7 +135,7 @@ def evaluate(
     for image_path in negatives:
         is_positive = predicted_positive(
             records=negative_records.get(str(image_path), []),
-            known_kids=known_kids,
+            kid_matrices=kid_matrices,
             tolerance=tolerance,
             min_face_px=min_face_px,
             min_votes=min_votes,
@@ -162,6 +176,7 @@ def main() -> None:
     positives = list_images(positive_root)
     negatives = list_images(negative_root)
     known_kids = build_kid_encodings(reference_root)
+    kid_matrices = build_kid_embedding_matrices(known_kids)
     runs = []
 
     if len(positives) == 0 or len(negatives) == 0:
@@ -180,7 +195,7 @@ def main() -> None:
             negatives=negatives,
             positive_records=positive_records,
             negative_records=negative_records,
-            known_kids=known_kids,
+            kid_matrices=kid_matrices,
             tolerance=float(candidate["tolerance"]),
             min_face_px=int(candidate["minFacePx"]),
             min_votes=int(candidate["minVotes"]),

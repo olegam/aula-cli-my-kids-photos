@@ -17,6 +17,9 @@ type RuntimeOptions = {
   referenceDir: string;
   pythonBin: string;
   pythonScript: string;
+  insightfaceModel: string | undefined;
+  insightfaceDetSize: string | undefined;
+  insightfaceProviders: string | undefined;
   tolerance: number;
   minFacePx: number;
   minVotes: number;
@@ -74,10 +77,13 @@ const DEFAULTS: RuntimeOptions = {
   referenceDir: "data/reference",
   pythonBin: "python3",
   pythonScript: "scripts/filter_kids.py",
-  tolerance: 0.48,
-  minFacePx: 70,
-  minVotes: 1,
-  distanceMargin: 0.02,
+  insightfaceModel: undefined,
+  insightfaceDetSize: undefined,
+  insightfaceProviders: undefined,
+  tolerance: 0.45,
+  minFacePx: 80,
+  minVotes: 2,
+  distanceMargin: 0.06,
   deleteUnmatched: true,
   latestAlbums: 0,
   moveUnmatchedToDir: undefined,
@@ -117,6 +123,9 @@ const runtimeOptionsFromArgs = (args: string[]): RuntimeOptions => {
   const baseUrl = parseCliFlag(args, "base-url") ?? DEFAULTS.baseUrl;
   const sessionPath = parseCliFlag(args, "session") ?? DEFAULTS.sessionPath;
   const pythonBin = parseCliFlag(args, "python") ?? DEFAULTS.pythonBin;
+  const insightfaceModel = parseCliFlag(args, "insightface-model") ?? DEFAULTS.insightfaceModel;
+  const insightfaceDetSize = parseCliFlag(args, "insightface-det-size") ?? DEFAULTS.insightfaceDetSize;
+  const insightfaceProviders = parseCliFlag(args, "insightface-providers") ?? DEFAULTS.insightfaceProviders;
   const tolerance = parseNumberFlag(args, "tolerance", DEFAULTS.tolerance);
   const minFacePx = Math.max(1, parseNumberFlag(args, "min-face-px", DEFAULTS.minFacePx));
   const minVotes = Math.max(1, parseNumberFlag(args, "min-votes", DEFAULTS.minVotes));
@@ -133,6 +142,9 @@ const runtimeOptionsFromArgs = (args: string[]): RuntimeOptions => {
     baseUrl,
     sessionPath,
     pythonBin,
+    insightfaceModel,
+    insightfaceDetSize,
+    insightfaceProviders,
     tolerance,
     minFacePx,
     minVotes,
@@ -145,9 +157,10 @@ const runtimeOptionsFromArgs = (args: string[]): RuntimeOptions => {
   };
 };
 
-const runCommand = async (cmd: string[], cwd: string): Promise<string> => {
+const runCommand = async (cmd: string[], cwd: string, env?: Record<string, string>): Promise<string> => {
   const proc = Bun.spawn(cmd, {
     cwd,
+    env: env ? { ...process.env, ...env } : process.env,
     stdout: "pipe",
     stderr: "pipe"
   });
@@ -158,6 +171,20 @@ const runCommand = async (cmd: string[], cwd: string): Promise<string> => {
     throw new Error(`Command failed (${cmd.join(" ")}): ${stderr || stdout}`);
   }
   return stdout.trim();
+};
+
+const insightfaceEnv = (options: RuntimeOptions): Record<string, string> => {
+  const env: Record<string, string> = {};
+  if (typeof options.insightfaceModel === "string" && options.insightfaceModel.trim().length > 0) {
+    env.INSIGHTFACE_MODEL = options.insightfaceModel.trim();
+  }
+  if (typeof options.insightfaceDetSize === "string" && options.insightfaceDetSize.trim().length > 0) {
+    env.INSIGHTFACE_DET_SIZE = options.insightfaceDetSize.trim();
+  }
+  if (typeof options.insightfaceProviders === "string" && options.insightfaceProviders.trim().length > 0) {
+    env.INSIGHTFACE_PROVIDERS = options.insightfaceProviders.trim();
+  }
+  return env;
 };
 
 const readJsonFile = async <T>(path: string): Promise<T> => {
@@ -563,7 +590,7 @@ const runPythonFilter = async (cwd: string, options: RuntimeOptions, downloads: 
     cmd.push("--delete-unmatched");
   }
 
-  await runCommand(cmd, cwd);
+  await runCommand(cmd, cwd, insightfaceEnv(options));
   return readJsonFile<FaceReport>(reportPath);
 };
 
@@ -779,7 +806,7 @@ const runTune = async (cwd: string, options: RuntimeOptions): Promise<void> => {
     `--report-path=${reportPath}`
   ];
   console.log(`Starting threshold tuning with ${iterations} iterations...`);
-  await runCommand(cmd, cwd);
+  await runCommand(cmd, cwd, insightfaceEnv(options));
   const report = await readJsonFile<{
     best?: {
       tolerance: number;
@@ -810,11 +837,52 @@ const runTune = async (cwd: string, options: RuntimeOptions): Promise<void> => {
   );
 };
 
+const runBenchmark = async (cwd: string, options: RuntimeOptions): Promise<void> => {
+  const imagesDir = parseCliFlag(process.argv.slice(2), "images-dir") ?? "data/photos";
+  const limit = Math.max(0, parseNumberFlag(process.argv.slice(2), "limit", 0));
+  const reportPath = resolve(cwd, options.cacheDir, "benchmark-report.json");
+  const cmd = [
+    options.pythonBin,
+    resolve(cwd, "scripts/benchmark_filter.py"),
+    `--reference-dir=${resolve(cwd, options.referenceDir)}`,
+    `--images-dir=${resolve(cwd, imagesDir)}`,
+    `--report-path=${reportPath}`,
+    `--tolerance=${options.tolerance.toString()}`,
+    `--min-face-px=${options.minFacePx.toString()}`,
+    `--min-votes=${options.minVotes.toString()}`,
+    `--distance-margin=${options.distanceMargin.toString()}`
+  ];
+  if (limit > 0) {
+    cmd.push(`--limit=${limit.toString()}`);
+  }
+  console.log(`Running face benchmark on ${imagesDir}${limit > 0 ? ` (limit ${limit})` : ""}...`);
+  await runCommand(cmd, cwd, insightfaceEnv(options));
+  const report = await readJsonFile<{
+    totalImages: number;
+    processedImages: number;
+    provider: string;
+    imagesPerSecond: number;
+    p50Ms: number;
+    p95Ms: number;
+    totalTimeSeconds: number;
+    matchedImages: number;
+    statusCounts: Record<string, number>;
+  }>(reportPath);
+  console.log(
+    `Benchmark complete: provider=${report.provider}, processed=${report.processedImages}/${report.totalImages}, ` +
+      `throughput=${report.imagesPerSecond.toFixed(2)} img/s, p50=${report.p50Ms.toFixed(1)}ms, p95=${report.p95Ms.toFixed(1)}ms, ` +
+      `matched=${report.matchedImages}, total=${report.totalTimeSeconds.toFixed(2)}s`
+  );
+  const gatePass = report.processedImages > 0 && report.p95Ms > 0;
+  console.log(`Benchmark gate (valid timing sample): ${gatePass ? "PASS" : "FAIL"}`);
+};
+
 const printHelp = (): void => {
   console.log("Usage:");
   console.log("  aula-cli-my-kids-photos init");
-  console.log("  aula-cli-my-kids-photos sync [--dry-run] [--keep-unmatched] [--tolerance=0.48] [--latest-albums=10]");
+  console.log("  aula-cli-my-kids-photos sync [--dry-run] [--keep-unmatched] [--tolerance=0.45] [--latest-albums=10]");
   console.log("  aula-cli-my-kids-photos tune [--positive-dir=...] [--negative-dir=...] [--iterations=10]");
+  console.log("  aula-cli-my-kids-photos benchmark [--images-dir=...] [--limit=500]");
   console.log("");
   console.log("Optional flags:");
   console.log("  --aula-cli=<command>   (default: aula-cli)");
@@ -824,9 +892,12 @@ const printHelp = (): void => {
   console.log("  --page-size=<number>   (default: 50)");
   console.log("  --latest-albums=<n>    (limit to newest n albums)");
   console.log("  --move-not-detected    (move unmatched photos to data/photos/not-detected)");
-  console.log("  --min-face-px=<n>      (default: 70)");
-  console.log("  --min-votes=<n>        (default: 1)");
-  console.log("  --distance-margin=<n>  (default: 0.02)");
+  console.log("  --min-face-px=<n>      (default: 80)");
+  console.log("  --min-votes=<n>        (default: 2)");
+  console.log("  --distance-margin=<n>  (default: 0.06)");
+  console.log("  --insightface-model=<name>      (default: buffalo_l)");
+  console.log("  --insightface-det-size=<n|w,h>  (default: 640,640)");
+  console.log("  --insightface-providers=<csv>   (override provider order)");
 };
 
 const main = async (): Promise<void> => {
@@ -852,6 +923,11 @@ const main = async (): Promise<void> => {
 
   if (command === "tune") {
     await runTune(cwd, options);
+    return;
+  }
+
+  if (command === "benchmark") {
+    await runBenchmark(cwd, options);
     return;
   }
 

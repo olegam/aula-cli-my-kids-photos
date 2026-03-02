@@ -10,31 +10,33 @@ Use this when you want a local folder of relevant Aula gallery photos without ma
 
 1. Login once with `aula-cli login`.
 2. Add reference photos per child in `data/reference/<child-name>/`.
-3. Run `aula-cli-my-kids-photos sync` regularly to fetch new media and keep only matching photos.
+3. Run `aula-cli-my-kids-photos sync --latest-albums=10` regularly to fetch recent media and keep only matching photos.
 
 ## Facial recognition stack
 
 Face matching is done with:
 
-- [`face_recognition`](https://github.com/ageitgey/face_recognition) (Python library used by this tool)
-- [`dlib`](https://github.com/davisking/dlib) (core C++/Python ML library used under the hood)
+- [`insightface`](https://github.com/deepinsight/insightface) (Python face analysis library)
+- [`buffalo_l`](https://github.com/deepinsight/insightface/tree/master/python-package#model-zoo) model pack (face detection + recognition)
+- [`onnxruntime`](https://onnxruntime.ai/) (inference runtime used by InsightFace)
 
 Matching is approximate, not exact. Think of results as "probably contains one of my kids" and tune with `--tolerance` if needed.
+
+Provider behavior:
+
+- Apple Silicon prefers `CoreMLExecutionProvider` and falls back to CPU automatically.
+- Other hardware tries CUDA/ROCm/OpenVINO/DML when available, then falls back to CPU.
+- Override provider order with `--insightface-providers=<csv>` when needed.
+
+On first run, InsightFace downloads the `buffalo_l` model pack automatically.
 
 ## Quick Start
 
 1. Install deps:
 
    ```bash
-   brew install cmake
    bun install
    python3 -m pip install -r requirements.txt
-   ```
-
-   If Python fails building `dlib`, install Apple command line tools and retry:
-
-   ```bash
-   xcode-select --install
    ```
 
 2. Link the CLI command locally:
@@ -67,7 +69,7 @@ Matching is approximate, not exact. Think of results as "probably contains one o
 6. Sync + filter:
 
    ```bash
-   aula-cli-my-kids-photos sync
+   aula-cli-my-kids-photos sync --latest-albums=10
    ```
 
 Everything runs locally on your machine.
@@ -92,18 +94,32 @@ Everything runs locally on your machine.
 
 ```bash
 aula-cli-my-kids-photos init
-aula-cli-my-kids-photos sync
+aula-cli-my-kids-photos sync --latest-albums=10
+aula-cli-my-kids-photos benchmark --images-dir=data/photos --limit=500
 ```
 
 Optional flags:
 
 - `--dry-run` (download/scan simulation)
 - `--keep-unmatched` (do not delete non-matching photos)
-- `--tolerance=0.47` (lower is stricter)
+- `--latest-albums=10` (recommended default: only newest albums)
+- `--tolerance=0.48` (higher is stricter)
+- `--min-face-px=80` (ignore very small faces)
+- `--min-votes=2` (minimum matching references before accept)
+- `--distance-margin=0.06` (winner vs runner-up confidence gap)
+- `--insightface-model=buffalo_l` (model pack override)
+- `--insightface-det-size=640,640` (detector input size; lower can be faster)
+- `--insightface-providers=CoreMLExecutionProvider,CPUExecutionProvider` (manual provider order)
 - `--aula-cli=<command>`
 - `--session=<path>`
 - `--base-url=<url>`
 - `--python=<command>`
+
+To process all albums instead of only recent ones:
+
+```bash
+aula-cli-my-kids-photos sync
+```
 
 ## Data files
 

@@ -58,6 +58,7 @@ type FaceReport = {
 type ChildSummary = {
   name: string;
   shortName?: string;
+  profileImageUrl?: string;
 };
 
 type AlbumSummary = {
@@ -699,6 +700,44 @@ const extractChildren = (payload: unknown): ChildSummary[] => {
   return children;
 };
 
+const extractChildrenFromProfilesByLogin = (payload: unknown): ChildSummary[] => {
+  const data = unwrapApiData(payload);
+  if (!isObject(data)) {
+    return [];
+  }
+  const profiles = data.profiles;
+  if (!Array.isArray(profiles) || profiles.length === 0) {
+    return [];
+  }
+  const primaryProfile = profiles.find((profile) => isObject(profile)) as JsonObject | undefined;
+  if (!primaryProfile) {
+    return [];
+  }
+  const rawChildren = primaryProfile.children;
+  if (!Array.isArray(rawChildren)) {
+    return [];
+  }
+
+  const children: ChildSummary[] = [];
+  for (const child of rawChildren) {
+    if (!isObject(child)) {
+      continue;
+    }
+    const name = getStr(child.name) ?? getStr(child.shortName);
+    if (!name) {
+      continue;
+    }
+    const profilePicture = isObject(child.profilePicture) ? child.profilePicture : undefined;
+    const profileImageUrl = profilePicture ? getStr(profilePicture.url) : undefined;
+    children.push({
+      name,
+      shortName: getStr(child.shortName),
+      profileImageUrl
+    });
+  }
+  return children;
+};
+
 const runInit = async (cwd: string, options: RuntimeOptions): Promise<void> => {
   const referenceDir = resolve(cwd, options.referenceDir);
   const photosDir = resolve(cwd, options.outputDir);
@@ -706,8 +745,12 @@ const runInit = async (cwd: string, options: RuntimeOptions): Promise<void> => {
 
   await Promise.all([ensureDir(referenceDir), ensureDir(photosDir), ensureDir(cacheDir)]);
 
-  const mePayload = await runAulaCliJson(options, cwd, ["me"]);
-  const children = extractChildren(mePayload);
+  const [profilesPayload, mePayload] = await Promise.all([
+    runAulaCliJson(options, cwd, ["fetch", "/api/v23/", "--query=method=profiles.getProfilesByLogin"]),
+    runAulaCliJson(options, cwd, ["me"])
+  ]);
+  const childrenFromProfiles = extractChildrenFromProfilesByLogin(profilesPayload);
+  const children = childrenFromProfiles.length > 0 ? childrenFromProfiles : extractChildren(mePayload);
 
   if (children.length === 0) {
     console.log("Initialized folders but could not detect children from `aula-cli me`.");
@@ -715,7 +758,10 @@ const runInit = async (cwd: string, options: RuntimeOptions): Promise<void> => {
     return;
   }
 
+  const cookieHeader = await cookieHeaderFromSession(expandHome(options.sessionPath));
   const created: string[] = [];
+  const seededProfileRefs: string[] = [];
+  const missingProfileRefs: string[] = [];
   const usedFolderNames = new Set<string>();
   for (const child of children) {
     const display = child.name ? extractFirstName(child.name) : child.shortName ?? "child";
@@ -724,6 +770,19 @@ const runInit = async (cwd: string, options: RuntimeOptions): Promise<void> => {
     const fullPath = join(referenceDir, folder);
     await ensureDir(fullPath);
     created.push(fullPath);
+    if (!child.profileImageUrl) {
+      missingProfileRefs.push(folder);
+      continue;
+    }
+    const profileImagePath = join(fullPath, `000_aula_profile${imageExtFromUrl(child.profileImageUrl)}`);
+    try {
+      const bytes = await downloadImage(child.profileImageUrl, cookieHeader);
+      await Bun.write(profileImagePath, new Uint8Array(bytes));
+      seededProfileRefs.push(folder);
+    } catch (error) {
+      console.warn(`Could not seed profile reference for ${folder}: ${String(error)}`);
+      missingProfileRefs.push(folder);
+    }
   }
 
   console.log("Initialization complete.");
@@ -731,9 +790,23 @@ const runInit = async (cwd: string, options: RuntimeOptions): Promise<void> => {
   for (const path of created) {
     console.log(`- ${basename(path)}`);
   }
+  if (seededProfileRefs.length > 0) {
+    console.log("");
+    console.log("Seeded first reference image from Aula profile picture:");
+    for (const folder of seededProfileRefs) {
+      console.log(`- ${folder}/000_aula_profile`);
+    }
+  }
+  if (missingProfileRefs.length > 0) {
+    console.log("");
+    console.log("No Aula profile image found (or download failed) for:");
+    for (const folder of missingProfileRefs) {
+      console.log(`- ${folder}`);
+    }
+  }
   console.log("");
   console.log("Next step:");
-  console.log(`Place 3-10 clear face photos per kid in ${referenceDir}/<kid-folder>/`);
+  console.log(`Add 2-9 additional clear face photos per kid in ${referenceDir}/<kid-folder>/`);
   console.log("Then run: aula-cli-my-kids-photos sync");
 };
 

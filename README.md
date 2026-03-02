@@ -57,9 +57,10 @@ On first run, InsightFace downloads the `buffalo_l` model pack automatically.
    aula-cli-my-kids-photos init
    ```
 
-5. Place reference photos:
+5. Add extra reference photos:
 
-   - Put 3-10 clear photos per kid in each folder under `data/reference/`.
+   - `init` automatically saves each kid's Aula profile image as the first reference in `data/reference/<kid>/`.
+   - Add 2-9 more clear photos per kid in each folder under `data/reference/`.
    - Example: `data/reference/emma/`, `data/reference/oliver/`.
    - Use photos with only one person visible (the target child).
    - Make sure the face is large, sharp, and fully visible (not far away, blurred, or heavily occluded).
@@ -81,7 +82,8 @@ Everything runs locally on your machine.
   - `data/photos/`
   - `data/cache/`
 - Calls `aula-cli me` and creates one child folder per kid under `data/reference/`.
-- Prints where to place reference photos before running sync.
+- Downloads each kid's Aula profile image into that kid folder as `000_aula_profile.*` when available.
+- Prints which folders were seeded and where to add extra reference photos before running sync.
 
 ## What `sync` does
 

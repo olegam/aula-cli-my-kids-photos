@@ -172,6 +172,12 @@ const unwrapApiData = (value: unknown): unknown => {
 
 const extractEntityList = (value: unknown): JsonObject[] => {
   const data = unwrapApiData(value);
+  if (isObject(data)) {
+    const results = data.results;
+    if (Array.isArray(results)) {
+      return results.filter((item): item is JsonObject => isObject(item));
+    }
+  }
   if (Array.isArray(data)) {
     return data.filter((item): item is JsonObject => isObject(item));
   }
@@ -181,6 +187,16 @@ const extractEntityList = (value: unknown): JsonObject[] => {
     return arrays;
   }
   return [];
+};
+
+const extractPaginatedResults = (value: unknown): { items: JsonObject[]; totalSize?: number } => {
+  const items = extractEntityList(value);
+  const data = unwrapApiData(value);
+  if (!isObject(data)) {
+    return { items };
+  }
+  const totalSize = getNum(data.totalSize) ?? getNum(data.mediaCount) ?? getNum(data.count);
+  return { items, totalSize };
 };
 
 const getNum = (value: unknown): number | undefined => {
@@ -224,12 +240,7 @@ const looksLikeImageUrl = (candidate: string): boolean => {
   return (
     lower.startsWith("http://") ||
     lower.startsWith("https://") ||
-    lower.startsWith("/") ||
-    lower.includes(".jpg") ||
-    lower.includes(".jpeg") ||
-    lower.includes(".png") ||
-    lower.includes(".webp") ||
-    lower.includes(".heic")
+    (lower.startsWith("/") && (lower.includes(".jpg") || lower.includes(".jpeg") || lower.includes(".png") || lower.includes(".webp") || lower.includes(".heic")))
   );
 };
 
@@ -241,10 +252,12 @@ const scoreUrlCandidate = (path: string, value: string): number => {
   if (p.includes("original")) score += 40;
   if (p.includes("image") || p.includes("media")) score += 25;
   if (p.endsWith("url") || p.includes(".url")) score += 20;
+  if (v.includes("media-prod.aula.dk")) score += 80;
   if (v.startsWith("https://") || v.startsWith("http://")) score += 20;
   if (v.includes(".jpg") || v.includes(".jpeg") || v.includes(".png") || v.includes(".webp") || v.includes(".heic")) score += 15;
   if (v.includes("/api/") || v.includes("/gallery/")) score += 10;
   if (v.includes("thumb")) score -= 30;
+  if (!v.startsWith("http://") && !v.startsWith("https://") && !v.startsWith("/")) score -= 100;
   return score;
 };
 
@@ -309,9 +322,10 @@ const saveState = async (statePath: string, state: DownloadState): Promise<void>
 
 const listAlbums = async (options: RuntimeOptions, cwd: string): Promise<number[]> => {
   const ids = new Set<number>();
-  for (let page = 0; page < options.maxAlbumPages; page++) {
-    const payload = await runAulaCliJson(options, cwd, ["gallery", "albums", `--index=${page}`, `--limit=${options.pageSize}`]);
-    const albums = extractEntityList(payload);
+  const maxOffset = options.maxAlbumPages * options.pageSize;
+  for (let index = 0; index < maxOffset; index += options.pageSize) {
+    const payload = await runAulaCliJson(options, cwd, ["gallery", "albums", `--index=${index}`, `--limit=${options.pageSize}`]);
+    const { items: albums, totalSize } = extractPaginatedResults(payload);
     if (albums.length === 0) {
       break;
     }
@@ -326,21 +340,28 @@ const listAlbums = async (options: RuntimeOptions, cwd: string): Promise<number[
     if (albums.length < options.pageSize) {
       break;
     }
+    if (typeof totalSize === "number" && index + options.pageSize >= totalSize) {
+      break;
+    }
   }
   return [...ids];
 };
 
 const listMediaForAlbum = async (options: RuntimeOptions, cwd: string, albumId: number): Promise<JsonObject[]> => {
   const media: JsonObject[] = [];
-  for (let page = 0; page < options.maxMediaPages; page++) {
-    const args = ["gallery", "media", `--album-id=${albumId}`, `--index=${page}`, `--limit=${options.pageSize}`];
+  const maxOffset = options.maxMediaPages * options.pageSize;
+  for (let index = 0; index < maxOffset; index += options.pageSize) {
+    const args = ["gallery", "media", `--album-id=${albumId}`, `--index=${index}`, `--limit=${options.pageSize}`];
     const payload = await runAulaCliJson(options, cwd, args);
-    const items = extractEntityList(payload);
+    const { items, totalSize } = extractPaginatedResults(payload);
     if (items.length === 0) {
       break;
     }
     media.push(...items);
     if (items.length < options.pageSize) {
+      break;
+    }
+    if (typeof totalSize === "number" && index + options.pageSize >= totalSize) {
       break;
     }
   }
@@ -383,6 +404,7 @@ const syncNewImages = async (cwd: string, options: RuntimeOptions): Promise<NewD
   await ensureDir(cacheDir);
 
   const newDownloads: NewDownload[] = [];
+  let sinceLastSave = 0;
   for (const albumId of albums) {
     const mediaItems = await listMediaForAlbum(options, cwd, albumId);
     for (const media of mediaItems) {
@@ -403,10 +425,16 @@ const syncNewImages = async (cwd: string, options: RuntimeOptions): Promise<NewD
       const outputPath = join(outputDir, fileName);
 
       if (!options.dryRun) {
-        const bytes = await downloadImage(sourceUrl, cookieHeader);
-        await Bun.write(outputPath, new Uint8Array(bytes));
+        try {
+          const bytes = await downloadImage(sourceUrl, cookieHeader);
+          await Bun.write(outputPath, new Uint8Array(bytes));
+        } catch (error) {
+          console.warn(`Skipping media ${mediaId}: ${String(error)}`);
+          continue;
+        }
       }
       processedSet.add(mediaKey);
+      sinceLastSave += 1;
       newDownloads.push({
         mediaKey,
         albumId,
@@ -414,6 +442,16 @@ const syncNewImages = async (cwd: string, options: RuntimeOptions): Promise<NewD
         outputPath,
         sourceUrl
       });
+      if (!options.dryRun && sinceLastSave >= 25) {
+        state.processedMediaKeys = [...processedSet];
+        await saveState(statePath, state);
+        sinceLastSave = 0;
+      }
+    }
+    if (!options.dryRun && sinceLastSave > 0) {
+      state.processedMediaKeys = [...processedSet];
+      await saveState(statePath, state);
+      sinceLastSave = 0;
     }
   }
 

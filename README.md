@@ -2,7 +2,7 @@
 
 Sync gallery images from Aula and keep only photos that contain your own kids using local face recognition.
 
-This tool is built on top of [`aula-cli`](https://github.com/olegam/aula-cli): `aula-cli` handles Aula authentication and API access, while this tool uses local facial recognition to store only the photos that contain your own kids.
+This tool is built on top of [`aula-cli`](https://github.com/olegam/aula-cli): `aula-cli` handles Aula authentication and API access, while this tool uses local facial recognition to keep photos that are likely to contain your kids based on your reference photos.
 
 ## Typical use case
 
@@ -18,6 +18,8 @@ Face matching is done with:
 
 - [`face_recognition`](https://github.com/ageitgey/face_recognition) (Python library used by this tool)
 - [`dlib`](https://github.com/davisking/dlib) (core C++/Python ML library used under the hood)
+
+Matching is approximate, not exact. Think of results as "probably contains one of my kids" and tune with `--tolerance` if needed.
 
 ## Quick Start
 
@@ -55,8 +57,12 @@ Face matching is done with:
 
 5. Place reference photos:
 
-   - Put 3-10 clear, front-facing photos per kid in each folder under `data/reference/`.
+   - Put 3-10 clear photos per kid in each folder under `data/reference/`.
    - Example: `data/reference/emma/`, `data/reference/oliver/`.
+   - Use photos with only one person visible (the target child).
+   - Make sure the face is large, sharp, and fully visible (not far away, blurred, or heavily occluded).
+   - Include variety across different days, lighting, angles, and clothing.
+   - Avoid near-duplicate shots from the same moment.
 
 6. Sync + filter:
 
@@ -80,7 +86,7 @@ Everything runs locally on your machine.
 1. Uses `aula-cli` to list albums and media.
 2. Downloads only new images (incremental sync).
 3. Runs local face recognition against your reference photos.
-4. Deletes photos that do not match any of your kids.
+4. Keeps photos with likely matches and deletes photos that do not match any of your kids.
 
 ## CLI usage
 

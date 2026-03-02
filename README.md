@@ -12,6 +12,13 @@ Use this when you want a local folder of relevant Aula gallery photos without ma
 2. Add reference photos per child in `data/reference/<child-name>/`.
 3. Run `aula-cli-my-kids-photos sync` regularly to fetch new media and keep only matching photos.
 
+## Facial recognition stack
+
+Face matching is done with:
+
+- [`face_recognition`](https://github.com/ageitgey/face_recognition) (Python library used by this tool)
+- [`dlib`](https://github.com/davisking/dlib) (core C++/Python ML library used under the hood)
+
 ## Quick Start
 
 1. Install deps:

@@ -18,12 +18,18 @@ type RuntimeOptions = {
   pythonBin: string;
   pythonScript: string;
   tolerance: number;
+  minFacePx: number;
+  minVotes: number;
+  distanceMargin: number;
   deleteUnmatched: boolean;
+  latestAlbums: number;
+  moveUnmatchedToDir: string | undefined;
   dryRun: boolean;
 };
 
 type DownloadState = {
-  processedMediaKeys: string[];
+  filteredMediaKeys: string[];
+  pendingDownloads: NewDownload[];
 };
 
 type NewDownload = {
@@ -40,11 +46,20 @@ type FaceReport = {
   removed: number;
   errors: number;
   keptByKid: Record<string, number>;
+  entries: Array<{
+    path?: string;
+    matchedKids?: string[];
+  }>;
 };
 
 type ChildSummary = {
   name: string;
   shortName?: string;
+};
+
+type AlbumSummary = {
+  id: number;
+  title: string;
 };
 
 const DEFAULTS: RuntimeOptions = {
@@ -59,8 +74,13 @@ const DEFAULTS: RuntimeOptions = {
   referenceDir: "data/reference",
   pythonBin: "python3",
   pythonScript: "scripts/filter_kids.py",
-  tolerance: 0.47,
+  tolerance: 0.48,
+  minFacePx: 70,
+  minVotes: 1,
+  distanceMargin: 0.02,
   deleteUnmatched: true,
+  latestAlbums: 0,
+  moveUnmatchedToDir: undefined,
   dryRun: false
 };
 
@@ -98,9 +118,14 @@ const runtimeOptionsFromArgs = (args: string[]): RuntimeOptions => {
   const sessionPath = parseCliFlag(args, "session") ?? DEFAULTS.sessionPath;
   const pythonBin = parseCliFlag(args, "python") ?? DEFAULTS.pythonBin;
   const tolerance = parseNumberFlag(args, "tolerance", DEFAULTS.tolerance);
+  const minFacePx = Math.max(1, parseNumberFlag(args, "min-face-px", DEFAULTS.minFacePx));
+  const minVotes = Math.max(1, parseNumberFlag(args, "min-votes", DEFAULTS.minVotes));
+  const distanceMargin = Math.max(0, parseNumberFlag(args, "distance-margin", DEFAULTS.distanceMargin));
   const pageSize = parseNumberFlag(args, "page-size", DEFAULTS.pageSize);
   const dryRun = hasFlag(args, "dry-run");
   const deleteUnmatched = !hasFlag(args, "keep-unmatched");
+  const latestAlbums = Math.max(0, parseNumberFlag(args, "latest-albums", DEFAULTS.latestAlbums));
+  const moveUnmatchedToDir = hasFlag(args, "move-not-detected") ? "not-detected" : undefined;
 
   return {
     ...DEFAULTS,
@@ -109,9 +134,14 @@ const runtimeOptionsFromArgs = (args: string[]): RuntimeOptions => {
     sessionPath,
     pythonBin,
     tolerance,
+    minFacePx,
+    minVotes,
+    distanceMargin,
     pageSize,
     dryRun,
-    deleteUnmatched
+    deleteUnmatched,
+    latestAlbums,
+    moveUnmatchedToDir
   };
 };
 
@@ -309,9 +339,25 @@ const runAulaCliJson = async (options: RuntimeOptions, cwd: string, args: string
 
 const loadState = async (statePath: string): Promise<DownloadState> => {
   try {
-    return await readJsonFile<DownloadState>(statePath);
+    const raw = await readJsonFile<{
+      filteredMediaKeys?: unknown;
+      pendingDownloads?: unknown;
+      processedMediaKeys?: unknown;
+    }>(statePath);
+    const filteredMediaKeys = Array.isArray(raw.filteredMediaKeys)
+      ? raw.filteredMediaKeys.filter((key): key is string => typeof key === "string")
+      : Array.isArray(raw.processedMediaKeys)
+        ? raw.processedMediaKeys.filter((key): key is string => typeof key === "string")
+        : [];
+    const pendingDownloads = Array.isArray(raw.pendingDownloads)
+      ? raw.pendingDownloads.filter((entry): entry is NewDownload => isObject(entry) && typeof entry.mediaKey === "string")
+      : [];
+    return {
+      filteredMediaKeys,
+      pendingDownloads
+    };
   } catch {
-    return { processedMediaKeys: [] };
+    return { filteredMediaKeys: [], pendingDownloads: [] };
   }
 };
 
@@ -320,8 +366,8 @@ const saveState = async (statePath: string, state: DownloadState): Promise<void>
   await writeFile(statePath, JSON.stringify(state, null, 2), "utf8");
 };
 
-const listAlbums = async (options: RuntimeOptions, cwd: string): Promise<number[]> => {
-  const ids = new Set<number>();
+const listAlbums = async (options: RuntimeOptions, cwd: string): Promise<AlbumSummary[]> => {
+  const albumsById = new Map<number, string>();
   const maxOffset = options.maxAlbumPages * options.pageSize;
   for (let index = 0; index < maxOffset; index += options.pageSize) {
     const payload = await runAulaCliJson(options, cwd, ["gallery", "albums", `--index=${index}`, `--limit=${options.pageSize}`]);
@@ -333,7 +379,10 @@ const listAlbums = async (options: RuntimeOptions, cwd: string): Promise<number[
     for (const album of albums) {
       const id = getNum(album.id);
       if (id) {
-        ids.add(id);
+        const title = getStr(album.title) ?? `album-${id}`;
+        if (!albumsById.has(id)) {
+          albumsById.set(id, title);
+        }
       }
     }
 
@@ -344,7 +393,11 @@ const listAlbums = async (options: RuntimeOptions, cwd: string): Promise<number[
       break;
     }
   }
-  return [...ids];
+  const albums = [...albumsById.entries()].map(([id, title]) => ({ id, title }));
+  if (options.latestAlbums > 0) {
+    return albums.slice(0, options.latestAlbums);
+  }
+  return albums;
 };
 
 const listMediaForAlbum = async (options: RuntimeOptions, cwd: string, albumId: number): Promise<JsonObject[]> => {
@@ -390,75 +443,95 @@ const buildMediaKey = (albumId: number, media: JsonObject, imageUrl: string): st
   return `${albumId}:${id}:${uploaded}:${imageUrl}`;
 };
 
-const syncNewImages = async (cwd: string, options: RuntimeOptions): Promise<NewDownload[]> => {
+const syncNewImages = async (cwd: string, options: RuntimeOptions, state: DownloadState, statePath: string): Promise<NewDownload[]> => {
   const sessionPath = expandHome(options.sessionPath);
   const cookieHeader = await cookieHeaderFromSession(sessionPath);
   const outputDir = resolve(cwd, options.outputDir);
   const cacheDir = resolve(cwd, options.cacheDir);
-  const statePath = join(cacheDir, "download-state.json");
-  const state = await loadState(statePath);
-  const processedSet = new Set(state.processedMediaKeys);
+  const pendingDir = join(cacheDir, "pending-images");
+  const filteredSet = new Set(state.filteredMediaKeys);
+  const pendingSet = new Set(state.pendingDownloads.map((entry) => entry.mediaKey));
   const albums = await listAlbums(options, cwd);
 
   await ensureDir(outputDir);
   await ensureDir(cacheDir);
+  await ensureDir(pendingDir);
 
   const newDownloads: NewDownload[] = [];
   let sinceLastSave = 0;
-  for (const albumId of albums) {
-    const mediaItems = await listMediaForAlbum(options, cwd, albumId);
+  let downloadedTotal = 0;
+  let skippedKnown = 0;
+  let skippedNoUrl = 0;
+  let failedDownloads = 0;
+  console.log(`Found ${albums.length} albums to scan.`);
+
+  for (let albumIndex = 0; albumIndex < albums.length; albumIndex += 1) {
+    const album = albums[albumIndex] as AlbumSummary;
+    console.log(`[${albumIndex + 1}/${albums.length}] Scanning album "${album.title}" (#${album.id})...`);
+    const mediaItems = await listMediaForAlbum(options, cwd, album.id);
+    console.log(`Found ${mediaItems.length} media items in "${album.title}".`);
+    let albumDownloads = 0;
     for (const media of mediaItems) {
       const mediaUrlCandidate = pickMediaUrl(media);
       if (!mediaUrlCandidate) {
+        skippedNoUrl += 1;
         continue;
       }
       const sourceUrl = toAbsoluteUrl(options.baseUrl, mediaUrlCandidate);
-      const mediaKey = buildMediaKey(albumId, media, sourceUrl);
-      if (processedSet.has(mediaKey)) {
+      const mediaKey = buildMediaKey(album.id, media, sourceUrl);
+      if (filteredSet.has(mediaKey) || pendingSet.has(mediaKey)) {
+        skippedKnown += 1;
         continue;
       }
 
       const mediaId = getStr(media.id) ?? getNum(media.id)?.toString() ?? `${newDownloads.length}`;
       const title = sanitizeFileChunk(getStr(media.title) ?? getStr(media.name) ?? "image");
       const ext = imageExtFromUrl(sourceUrl);
-      const fileName = `${albumId}_${mediaId}_${title}${ext}`;
-      const outputPath = join(outputDir, fileName);
+      const fileName = `${album.id}_${mediaId}_${title}${ext}`;
+      const outputPath = join(pendingDir, fileName);
 
       if (!options.dryRun) {
         try {
           const bytes = await downloadImage(sourceUrl, cookieHeader);
           await Bun.write(outputPath, new Uint8Array(bytes));
         } catch (error) {
+          failedDownloads += 1;
           console.warn(`Skipping media ${mediaId}: ${String(error)}`);
           continue;
         }
       }
-      processedSet.add(mediaKey);
-      sinceLastSave += 1;
-      newDownloads.push({
+      const downloadEntry: NewDownload = {
         mediaKey,
-        albumId,
+        albumId: album.id,
         mediaId,
         outputPath,
         sourceUrl
-      });
+      };
+      if (!options.dryRun) {
+        state.pendingDownloads.push(downloadEntry);
+        pendingSet.add(mediaKey);
+      }
+      sinceLastSave += 1;
+      newDownloads.push(downloadEntry);
+      albumDownloads += 1;
+      downloadedTotal += 1;
+      if (downloadedTotal % 25 === 0) {
+        console.log(`Downloaded ${downloadedTotal} new images so far...`);
+      }
       if (!options.dryRun && sinceLastSave >= 25) {
-        state.processedMediaKeys = [...processedSet];
         await saveState(statePath, state);
         sinceLastSave = 0;
       }
     }
-    if (!options.dryRun && sinceLastSave > 0) {
-      state.processedMediaKeys = [...processedSet];
-      await saveState(statePath, state);
-      sinceLastSave = 0;
-    }
+    console.log(`Finished album "${album.title}": downloaded ${albumDownloads} new images.`);
   }
 
-  state.processedMediaKeys = [...processedSet];
-  if (!options.dryRun) {
+  if (!options.dryRun && sinceLastSave > 0) {
     await saveState(statePath, state);
   }
+  console.log(
+    `Download phase complete: ${downloadedTotal} new, ${skippedKnown} already-processed, ${skippedNoUrl} no-usable-url, ${failedDownloads} failed downloads.`
+  );
   return newDownloads;
 };
 
@@ -476,15 +549,74 @@ const runPythonFilter = async (cwd: string, options: RuntimeOptions, downloads: 
     resolve(cwd, options.pythonScript),
     `--manifest=${manifestPath}`,
     `--reference-dir=${resolve(cwd, options.referenceDir)}`,
+    `--output-dir=${resolve(cwd, options.outputDir)}`,
     `--report-path=${reportPath}`,
-    `--tolerance=${options.tolerance.toString()}`
+    `--tolerance=${options.tolerance.toString()}`,
+    `--min-face-px=${options.minFacePx.toString()}`,
+    `--min-votes=${options.minVotes.toString()}`,
+    `--distance-margin=${options.distanceMargin.toString()}`
   ];
+  if (options.moveUnmatchedToDir) {
+    cmd.push(`--unmatched-dir=${resolve(cwd, options.outputDir, options.moveUnmatchedToDir)}`);
+  }
   if (options.deleteUnmatched) {
     cmd.push("--delete-unmatched");
   }
 
   await runCommand(cmd, cwd);
   return readJsonFile<FaceReport>(reportPath);
+};
+
+const mergeFaceReports = (reports: FaceReport[]): FaceReport | undefined => {
+  if (reports.length === 0) {
+    return undefined;
+  }
+  const merged: FaceReport = {
+    total: 0,
+    kept: 0,
+    removed: 0,
+    errors: 0,
+    keptByKid: {},
+    entries: []
+  };
+  for (const report of reports) {
+    merged.total += report.total;
+    merged.kept += report.kept;
+    merged.removed += report.removed;
+    merged.errors += report.errors;
+    for (const [kid, count] of Object.entries(report.keptByKid)) {
+      merged.keptByKid[kid] = (merged.keptByKid[kid] ?? 0) + count;
+    }
+    if (Array.isArray(report.entries)) {
+      merged.entries.push(...report.entries);
+    }
+  }
+  return merged;
+};
+
+const flushPendingDownloads = async (
+  cwd: string,
+  options: RuntimeOptions,
+  state: DownloadState,
+  statePath: string
+): Promise<FaceReport | undefined> => {
+  if (options.dryRun || state.pendingDownloads.length === 0) {
+    return undefined;
+  }
+  console.log(`Running face recognition on ${state.pendingDownloads.length} pending images...`);
+  const report = await runPythonFilter(cwd, options, state.pendingDownloads);
+  if (!report) {
+    return undefined;
+  }
+  const filteredSet = new Set(state.filteredMediaKeys);
+  for (const pending of state.pendingDownloads) {
+    filteredSet.add(pending.mediaKey);
+  }
+  state.filteredMediaKeys = [...filteredSet];
+  state.pendingDownloads = [];
+  await saveState(statePath, state);
+  console.log(`Face recognition complete: kept ${report.kept}, removed ${report.removed}, errors ${report.errors}.`);
+  return report;
 };
 
 const slugifyFolderName = (value: string): string => {
@@ -580,10 +712,30 @@ const runInit = async (cwd: string, options: RuntimeOptions): Promise<void> => {
 
 const runSync = async (cwd: string, options: RuntimeOptions): Promise<void> => {
   await Promise.all([ensureDir(resolve(cwd, options.referenceDir)), ensureDir(resolve(cwd, options.outputDir)), ensureDir(resolve(cwd, options.cacheDir))]);
-  const downloads = await syncNewImages(cwd, options);
-  const report = await runPythonFilter(cwd, options, downloads);
+  console.log("Starting sync...");
+  const statePath = join(resolve(cwd, options.cacheDir), "download-state.json");
+  const state = await loadState(statePath);
+  const reports: FaceReport[] = [];
+
+  const resumedPendingCount = state.pendingDownloads.length;
+  if (resumedPendingCount > 0) {
+    const resumed = await flushPendingDownloads(cwd, options, state, statePath);
+    if (resumed) {
+      reports.push(resumed);
+    }
+  }
+
+  const downloads = await syncNewImages(cwd, options, state, statePath);
+  const current = await flushPendingDownloads(cwd, options, state, statePath);
+  if (current) {
+    reports.push(current);
+  }
+  const report = mergeFaceReports(reports);
 
   console.log(`Downloaded new images: ${downloads.length}`);
+  if (resumedPendingCount > 0) {
+    console.log(`Resumed pending analysis items: ${resumedPendingCount}`);
+  }
   if (!report) {
     console.log("No new images to analyze.");
     return;
@@ -597,12 +749,72 @@ const runSync = async (cwd: string, options: RuntimeOptions): Promise<void> => {
       console.log(`  ${kid}: ${count}`);
     }
   }
+  const keptFileNames = Array.from(
+    new Set(
+      (report.entries ?? [])
+        .filter((entry) => Array.isArray(entry.matchedKids) && entry.matchedKids.length > 0 && typeof entry.path === "string")
+        .map((entry) => basename(entry.path as string))
+    )
+  );
+  if (keptFileNames.length > 0) {
+    console.log("New images with your kids since last sync:");
+    for (const fileName of keptFileNames) {
+      console.log(`- ${fileName}`);
+    }
+  }
+};
+
+const runTune = async (cwd: string, options: RuntimeOptions): Promise<void> => {
+  const positiveDir = parseCliFlag(process.argv.slice(2), "positive-dir") ?? "data/tuning/contains-kids";
+  const negativeDir = parseCliFlag(process.argv.slice(2), "negative-dir") ?? "data/tuning/not-kids";
+  const iterations = Math.max(1, parseNumberFlag(process.argv.slice(2), "iterations", 10));
+  const reportPath = resolve(cwd, options.cacheDir, "tuning-report.json");
+  const cmd = [
+    options.pythonBin,
+    resolve(cwd, "scripts/tune_thresholds.py"),
+    `--reference-dir=${resolve(cwd, options.referenceDir)}`,
+    `--positive-dir=${resolve(cwd, positiveDir)}`,
+    `--negative-dir=${resolve(cwd, negativeDir)}`,
+    `--iterations=${iterations.toString()}`,
+    `--report-path=${reportPath}`
+  ];
+  console.log(`Starting threshold tuning with ${iterations} iterations...`);
+  await runCommand(cmd, cwd);
+  const report = await readJsonFile<{
+    best?: {
+      tolerance: number;
+      minFacePx: number;
+      minVotes: number;
+      distanceMargin: number;
+      totalErrors: number;
+      accuracy: number;
+      precision: number;
+      recall: number;
+    };
+    runs?: Array<unknown>;
+  }>(reportPath);
+  if (!report.best) {
+    console.log("No tuning result found.");
+    return;
+  }
+  console.log(`Best thresholds after ${report.runs?.length ?? iterations} runs:`);
+  console.log(
+    `tolerance=${report.best.tolerance}, minFacePx=${report.best.minFacePx}, minVotes=${report.best.minVotes}, distanceMargin=${report.best.distanceMargin}`
+  );
+  console.log(
+    `accuracy=${report.best.accuracy.toFixed(4)}, precision=${report.best.precision.toFixed(4)}, recall=${report.best.recall.toFixed(4)}, totalErrors=${report.best.totalErrors}`
+  );
+  console.log("Use with sync:");
+  console.log(
+    `aula-cli-my-kids-photos sync --tolerance=${report.best.tolerance} --min-face-px=${report.best.minFacePx} --min-votes=${report.best.minVotes} --distance-margin=${report.best.distanceMargin}`
+  );
 };
 
 const printHelp = (): void => {
   console.log("Usage:");
   console.log("  aula-cli-my-kids-photos init");
-  console.log("  aula-cli-my-kids-photos sync [--dry-run] [--keep-unmatched] [--tolerance=0.47]");
+  console.log("  aula-cli-my-kids-photos sync [--dry-run] [--keep-unmatched] [--tolerance=0.48] [--latest-albums=10]");
+  console.log("  aula-cli-my-kids-photos tune [--positive-dir=...] [--negative-dir=...] [--iterations=10]");
   console.log("");
   console.log("Optional flags:");
   console.log("  --aula-cli=<command>   (default: aula-cli)");
@@ -610,6 +822,11 @@ const printHelp = (): void => {
   console.log("  --base-url=<url>       (default: https://www.aula.dk)");
   console.log("  --python=<command>     (default: python3)");
   console.log("  --page-size=<number>   (default: 50)");
+  console.log("  --latest-albums=<n>    (limit to newest n albums)");
+  console.log("  --move-not-detected    (move unmatched photos to data/photos/not-detected)");
+  console.log("  --min-face-px=<n>      (default: 70)");
+  console.log("  --min-votes=<n>        (default: 1)");
+  console.log("  --distance-margin=<n>  (default: 0.02)");
 };
 
 const main = async (): Promise<void> => {
@@ -630,6 +847,11 @@ const main = async (): Promise<void> => {
 
   if (command === "sync") {
     await runSync(cwd, options);
+    return;
+  }
+
+  if (command === "tune") {
+    await runTune(cwd, options);
     return;
   }
 

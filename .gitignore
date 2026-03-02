@@ -5,3 +5,5 @@ node_modules
 data/photos
 data/cache
 data/reference
+data/tuning
+scripts/__pycache__
